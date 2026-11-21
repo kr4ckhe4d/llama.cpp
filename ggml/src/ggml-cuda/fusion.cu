@@ -2022,6 +2022,8 @@ static int ggml_cuda_match_ssm_conv_step(const ggml_cgraph * cgraph, int i) {
     if (ob < pe && pb < oe) {
         return -1;
     }
+    return i + 7;
+}
 
 static int ggml_cuda_mul_mat_vec_f_group(const ggml_cgraph * cgraph, int i) {
     const ggml_tensor * first = cgraph->nodes[i];
