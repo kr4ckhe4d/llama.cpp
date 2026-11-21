@@ -1,6 +1,7 @@
 #include "fusion.cuh"
 #include "graph.cuh"
 #include "binbcast.cuh"
+#include "depth-mix.cuh"
 #include "dsv4-hc.cuh"
 #include "fp8.cuh"
 #include "fwht.cuh"
@@ -2074,6 +2075,11 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                                        cgraph->nodes[last]);
             return last - i;
         }
+    }
+
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_match_depth_mix(cgraph, i)) {
+        ggml_cuda_op_depth_mix(*cuda_ctx, cgraph, i);
+        return 6;
     }
 
     if (int n = ggml_cuda_try_fuse_inkling2(cuda_ctx, cgraph, i)) {
