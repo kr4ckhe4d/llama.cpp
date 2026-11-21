@@ -1951,7 +1951,7 @@ static int ggml_cuda_try_fuse_inkling2(ggml_backend_cuda_context * cuda_ctx, ggm
 // same src1, 2D contiguous src0 of one type and row length, and no node reading another's result
 // a short convolution step for one token: CONCAT(history, x) -> VIEW(last n_conv - 1 columns) -> VIEW(state cell)
 // -> CPY -> SSM_CONV -> RESHAPE -> ADD(residual) -> SCALE (Inkling 2), returns the index of the SCALE or -1
-static int ggml_cuda_match_ssm_conv_step(const ggml_cgraph * cgraph, int i) {
+static int ggml_cuda_match_ssm_conv_step(const ggml_cgraph * cgraph, int i, bool check_memory = true) {
     if (i + 7 >= cgraph->n_nodes) {
         return -1;
     }
@@ -2009,19 +2009,10 @@ static int ggml_cuda_match_ssm_conv_step(const ggml_cgraph * cgraph, int i) {
             return -1;
         }
     }
-    // the output may share memory with the residual (read at the index written) but not with the history
-    auto span = [](const ggml_tensor * t, int64_t & beg, int64_t & end) {
-        beg = (int64_t) t->data;
-        end = beg;
-        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-            end += (t->ne[d] - 1)*t->nb[d];
-        }
-        end += ggml_type_size(t->type);
-    };
-    int64_t ob, oe, pb, pe;
-    span(scale, ob, oe);
-    span(past, pb, pe);
-    if (ob < pe && pb < oe) {
+    // the history and the weights are read across channels, x and the residual element-wise (x as [1, nc] of cur)
+    if (check_memory && (ggml_cuda_fusion_overlap(scale, past) || ggml_cuda_fusion_overlap(scale, w) ||
+            !ggml_cuda_fusion_elementwise_ok(scale, res) ||
+            (ggml_cuda_fusion_overlap(scale, x) && !(scale->data == x->data && x->nb[1] == sizeof(float))))) {
         return -1;
     }
     return i + 7;
@@ -2095,6 +2086,14 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
         const int last = ggml_cuda_match_mul_l2_norm(cgraph, i);
         if (last > 0) {
             ggml_cuda_op_mul_l2_norm(*cuda_ctx, cgraph, i, last);
+            return last - i;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int last = ggml_cuda_match_rel_bias(cgraph, i);
+        if (last > 0) {
+            ggml_cuda_op_rel_bias(*cuda_ctx, cgraph, i, last);
             return last - i;
         }
     }
@@ -2686,6 +2685,30 @@ void ggml_cuda_fusion_add_alloc_deps(ggml_backend_cuda_context * cuda_ctx, ggml_
             if (ok && ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device)) {
                 add_alloc_deps(i, i + 2);
                 i += 2;
+                continue;
+            }
+        }
+
+        // the fused single-token kernels (Inkling 2): keep their inputs alive until their last node, so that
+        // the output they write early is never placed over an input they still read
+        {
+            int last = -1;
+            const ggml_op op = cgraph->nodes[i]->op;
+            if (op == GGML_OP_CONCAT) {
+                last = ggml_cuda_match_ssm_conv_step(cgraph, i, false);
+            } else if (op == GGML_OP_RMS_NORM) {
+                last = ggml_cuda_match_depth_mix(cgraph, i, false) ? i + 6 : -1;
+            } else if (op == GGML_OP_MUL) {
+                last = ggml_cuda_match_mul_l2_norm(cgraph, i, false);
+            } else if (op == GGML_OP_MUL_MAT) {
+                last = ggml_cuda_match_rel_bias(cgraph, i, false);
+                if (last < 0) {
+                    last = ggml_cuda_match_ctrl_mix(cgraph, i, false);
+                }
+            }
+            if (last > i) {
+                add_alloc_deps(i, last);
+                i = last;
                 continue;
             }
         }
