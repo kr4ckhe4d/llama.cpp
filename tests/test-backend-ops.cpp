@@ -3890,6 +3890,7 @@ struct test_softcap : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     float softcap;
+    bool strided; // the input is the first half of each row of a wider tensor (a half of a fused gate_up)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3899,19 +3900,25 @@ struct test_softcap : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne, softcap);
+        return VARS_TO_STR4(type, ne, softcap, strided);
     }
 
     test_softcap(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {10, 10, 10, 10},
-            float softcap = 30.0f)
-        : type(type), ne(ne), softcap(softcap) {}
+            float softcap = 30.0f,
+            bool strided = false)
+        : type(type), ne(ne), softcap(softcap), strided(strided) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, type, strided ? 2*ne[0] : ne[0], ne[1], ne[2], ne[3]);
 
         ggml_set_param(a);
         ggml_set_name(a, "a");
+
+        if (strided) {
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "a_half");
+        }
 
         ggml_tensor * out = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, a, 1.0f / softcap)), softcap);
         ggml_set_name(out, "out");
@@ -5548,100 +5555,42 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
-// GGML_OP_CONCAT(conv_state, transpose(x), 0) + optional GGML_OP_CPY(state_out) + GGML_OP_SSM_CONV + optional GGML_OP_UNARY(SILU)
-struct test_ssm_conv_concat_fusion : public test_case {
+// GGML_OP_SSM_CONV + GGML_OP_RESHAPE + GGML_OP_ADD (residual) + GGML_OP_SCALE (fused operation, Inkling 2)
+struct test_ssm_conv_res_scale : public test_case {
     const ggml_type type;
-    const int64_t   d_conv;
-    const int64_t   d_inner;
-    const int64_t   n_t;
-    const int64_t   n_s;
-    const bool      use_silu;
-    const bool      has_state_cpy;
-
-    ggml_tensor * conv_out_node  = nullptr;
-    ggml_tensor * state_out_node = nullptr;
+    const std::array<int64_t, 4> ne_a;
+    const std::array<int64_t, 4> ne_b;
+    const float scale;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "SSM_CONV_CONCAT_FUSION";
+        return "SSM_CONV_RES_SCALE";
     }
 
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR7(type, d_conv, d_inner, n_t, n_s, use_silu, has_state_cpy);
+        return VARS_TO_STR4(type, ne_a, ne_b, scale);
     }
 
-    test_ssm_conv_concat_fusion(ggml_type type, int64_t d_conv, int64_t d_inner, int64_t n_t, int64_t n_s,
-                                bool use_silu, bool has_state_cpy)
-        : type(type), d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s),
-          use_silu(use_silu), has_state_cpy(has_state_cpy) {}
-
-    double max_nmse_err(ggml_backend_t backend) override {
-        return is_htp_backend(backend) ? 1e-4 : test_case::max_nmse_err(backend);
-    }
-
-    std::vector<ggml_tensor *> fusion_test_nodes() override {
-        if (has_state_cpy && state_out_node) {
-            return { conv_out_node, state_out_node };
-        }
-        return { conv_out_node };
-    }
+    test_ssm_conv_res_scale(ggml_type type, std::array<int64_t, 4> ne_a, std::array<int64_t, 4> ne_b, float scale)
+        : type(type), ne_a(ne_a), ne_b(ne_b), scale(scale) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t s_cols = d_conv - 1;
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
 
-        ggml_tensor * state = ggml_new_tensor_3d(ctx, type, s_cols, d_inner, n_s);
-        ggml_set_name(state, "state");
+        ggml_tensor * conv = ggml_ssm_conv(ctx, a, b);
+        conv = ggml_reshape_2d(ctx, conv, conv->ne[0], conv->ne[1]*conv->ne[2]);
 
-        ggml_tensor * x_raw = ggml_new_tensor_3d(ctx, type, d_inner, n_t, n_s);
-        ggml_set_name(x_raw, "x_raw");
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, type, conv->ne[0], conv->ne[1]);
+        ggml_set_name(res, "res");
 
-        // Feed rms_norm output into concat/ssm_conv so internal activations can be lowered while state stays F32
-        ggml_tensor * x = ggml_rms_norm(ctx, x_raw, 1e-5f);
-        ggml_set_name(x, "x");
-
-        ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, d_conv, d_inner);
-        ggml_set_name(weight, "weight");
-
-        ggml_tensor * conv_x = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
-        ggml_set_name(conv_x, "conv_x");
-
-        if (has_state_cpy) {
-            const int64_t mem_size = n_s + 2;
-            const int64_t kv_head  = 1;
-
-            ggml_tensor * last = ggml_view_3d(ctx, conv_x,
-                    s_cols, d_inner, n_s,
-                    conv_x->nb[1], conv_x->nb[2],
-                    ggml_row_size(conv_x->type, n_t));
-            ggml_set_name(last, "conv_x_tail");
-
-            ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, s_cols * d_inner, mem_size);
-            ggml_set_name(cache, "cache");
-
-            ggml_tensor * cell = ggml_view_2d(ctx, cache,
-                    s_cols * d_inner, n_s,
-                    cache->nb[1], kv_head * cache->nb[1]);
-            ggml_set_name(cell, "cell");
-
-            state_out_node = ggml_cpy(ctx, last, cell);
-            ggml_set_name(state_out_node, "state_cpy");
-            ggml_build_forward_expand(gf, state_out_node);
-        }
-
-        ggml_tensor * out = ggml_ssm_conv(ctx, conv_x, weight);
-        ggml_set_name(out, "conv_raw");
-
-        if (use_silu) {
-            out = ggml_silu(ctx, out);
-            ggml_set_name(out, "conv_silu");
-        }
-
-        // Consume conv output via rms_norm so conv output is an internal activation
-        conv_out_node = ggml_rms_norm(ctx, out, 1e-5f);
-        ggml_set_name(conv_out_node, "out");
-        return conv_out_node;
+        ggml_tensor * out = ggml_scale(ctx, ggml_add(ctx, res, conv), scale);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -13100,6 +13049,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f, true, 1)); // view test, inplace
     test_cases.emplace_back(new test_scale(GGML_TYPE_F16, {10, 10, 10, 10}, 2.0f, 1.0f, false, 1)); // view test
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
+    test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {1152, 8, 1, 1}, 4.0f, true));
+    test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {64, 5, 3, 2}, 25.0f, true));
     test_cases.emplace_back(new test_silu_back());
     test_cases.emplace_back(new test_sigmoid_back());
 
@@ -13296,6 +13247,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
+    }
+
+    // fused ssm_conv + residual add + scale (Inkling 2 short convolutions)
+    for (int64_t d_inner : {1024, 2304}) {
+        test_cases.emplace_back(new test_ssm_conv_res_scale(GGML_TYPE_F32, {4, d_inner, 1, 1}, {4, d_inner, 1, 1}, 0.447f));
+        test_cases.emplace_back(new test_ssm_conv_res_scale(GGML_TYPE_F32, {4, d_inner, 4, 1}, {4, d_inner, 1, 1}, 0.447f));
+        test_cases.emplace_back(new test_ssm_conv_res_scale(GGML_TYPE_F32, {3 + 64, d_inner, 1, 1}, {4, d_inner, 1, 1}, 0.447f));
+        test_cases.emplace_back(new test_ssm_conv_res_scale(GGML_TYPE_F32, {3 + 64, d_inner, 2, 1}, {4, d_inner, 1, 1}, 0.447f));
     }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
@@ -15292,6 +15251,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_topk_moe({8, 22, 1, 1}, 4, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
         test_cases.emplace_back(new test_topk_moe({384,  1, 1, 1}, 6, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
     }
+    // Inkling 2: 128 experts, top 8, weights scaled by 8
+    test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
+    test_cases.emplace_back(new test_topk_moe({128, 5, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));

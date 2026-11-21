@@ -2667,7 +2667,7 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, ggml_tensor * message_norm, const loop_layer & loop, int ctrl);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2687,11 +2687,15 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
 
-        // the normalized state stacks of mix(), keyed by their tensors
-        ggml_tensor * mix_stack(const std::vector<ggml_tensor *> & list);
-        std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_stacks;
-
-        std::map<int64_t, ggml_tensor *> zero_sinks; // by head count
+        // ggml_cont only where the layout needs it, a contiguous view (one token) costs no copy
+        ggml_tensor * cont(ggml_tensor * cur);
+        // the RMS-normalized blocks stacked as [n_embd, n_blocks, n_tokens] and transposed, built once per prefix
+        std::pair<ggml_tensor *, ggml_tensor *> stack(const std::vector<ggml_tensor *> & blocks);
+        std::map<std::vector<ggml_tensor *>, std::pair<ggml_tensor *, ggml_tensor *>> stacks;
+        // RMS norms of the shared layer inputs, and the zero attention sinks, built once per graph
+        ggml_tensor * rms_norm_once(ggml_tensor * cur);
+        std::map<ggml_tensor *, ggml_tensor *> rms_norms;
+        std::map<int64_t, ggml_tensor *> zero_sinks;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
