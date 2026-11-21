@@ -2091,6 +2091,14 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
         }
     }
 
+    if (node->op == GGML_OP_MUL) {
+        const int last = ggml_cuda_match_mul_l2_norm(cgraph, i);
+        if (last > 0) {
+            ggml_cuda_op_mul_l2_norm(*cuda_ctx, cgraph, i, last);
+            return last - i;
+        }
+    }
+
     if (int n = ggml_cuda_try_fuse_inkling2(cuda_ctx, cgraph, i)) {
         return n;
     }
