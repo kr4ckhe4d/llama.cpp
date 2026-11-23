@@ -550,7 +550,32 @@ struct messages_inp_normalizer {
     // if string=true and array=false, convert array to string
     // if string=false and array=true, convert string to array
     // if both are true, do nothing
-    json normalize(const json & messages) {
+    // a tool_reference part (a tool search result naming a deferred tool) has no text and no template knows its
+    // type: templates that iterate typed parts raise on it (Inkling 2: "Unsupported content part type"). The
+    // deferred tool itself reaches the template through the tools list, so the part becomes a line of text.
+    static json tool_references_to_text(const json & messages) {
+        if (!messages.is_array()) {
+            return messages;
+        }
+        json out = messages;
+        for (auto & msg : out) {
+            if (!msg.is_object() || !msg.contains("content") || !msg.at("content").is_array()) {
+                continue;
+            }
+            for (auto & part : msg.at("content")) {
+                if (part.is_object() && part.value("type", "") == "tool_reference") {
+                    part = json{
+                        {"type", "text"},
+                        {"text", "Tool loaded: " + part.value("name", std::string())},
+                    };
+                }
+            }
+        }
+        return out;
+    }
+
+    json normalize(const json & messages_in) {
+        const json messages = tool_references_to_text(messages_in);
         bool only_string = caps.supports_string_content && !caps.supports_typed_content;
         bool only_typed  = !caps.supports_string_content && caps.supports_typed_content;
         if ((!only_string && !only_typed) || !messages.is_array()) {
