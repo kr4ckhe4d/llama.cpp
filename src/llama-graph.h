@@ -1573,7 +1573,8 @@ struct llm_graph_context {
             ggml_tensor * bias_table, // [n_bins, n_head_q, n_tokens]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * rel_table = nullptr) const; // instead of kq_b: [n_head_q, n_dist, n_tokens], gathered here
 
     //
     // pooling
