@@ -3,6 +3,7 @@
 #include "binbcast.cuh"
 #include "attn-prep.cuh"
 #include "depth-mix.cuh"
+#include "ctrl-batch.cuh"
 #include "ctrl-mix.cuh"
 #include "dsv4-hc.cuh"
 #include "fp8.cuh"
@@ -2061,6 +2062,14 @@ static int ggml_cuda_mul_mat_vec_f_group(const ggml_cgraph * cgraph, int i) {
 int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_CONCAT) {
+        const int last = ggml_cuda_match_ctrl_batch(cgraph, i);
+        if (last > 0) {
+            ggml_cuda_op_ctrl_batch(*cuda_ctx, cgraph, i, last);
+            return last - i;
+        }
+    }
+
     // the one-token Inkling 2 fusions of this branch are tried before the upstream patterns
     if (node->op == GGML_OP_CONCAT) {
         const int last = ggml_cuda_match_ssm_conv_step(cgraph, i);
@@ -2721,7 +2730,10 @@ void ggml_cuda_fusion_add_alloc_deps(ggml_backend_cuda_context * cuda_ctx, ggml_
             int last = -1;
             const ggml_op op = cgraph->nodes[i]->op;
             if (op == GGML_OP_CONCAT) {
-                last = ggml_cuda_match_ssm_conv_step(cgraph, i, false);
+                last = ggml_cuda_match_ctrl_batch(cgraph, i, false);
+                if (last < 0) {
+                    last = ggml_cuda_match_ssm_conv_step(cgraph, i, false);
+                }
             } else if (op == GGML_OP_RMS_NORM) {
                 last = ggml_cuda_match_depth_mix(cgraph, i, false) ? i + 6 : -1;
             } else if (op == GGML_OP_MUL) {
