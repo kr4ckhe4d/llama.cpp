@@ -1950,6 +1950,43 @@ static int ggml_cuda_try_fuse_inkling2(ggml_backend_cuda_context * cuda_ctx, ggm
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// a residual ADD right after a conv step (Inkling 2: the layer residual after the attention-out and FFN-out convolutions),
+// which the step can write instead of its own output: returns the index of the ADD, or -1
+static int ggml_cuda_match_ssm_conv_step_residual(const ggml_cgraph * cgraph, int i, int last, bool check_memory = true) {
+    const int k = last + 1;
+    if (k >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * scale = cgraph->nodes[last];
+    const ggml_tensor * add2  = cgraph->nodes[k];
+    if (add2->op != GGML_OP_ADD || (add2->src[0] != scale && add2->src[1] != scale) || !(add2->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return -1;
+    }
+    const ggml_tensor * res2 = add2->src[0] == scale ? add2->src[1] : add2->src[0];
+    if (add2->src[0] == add2->src[1] || res2->type != GGML_TYPE_F32 || add2->type != GGML_TYPE_F32 || !ggml_is_contiguous(res2) ||
+            !ggml_is_contiguous(add2) || !ggml_are_same_shape(res2, scale) || !ggml_are_same_shape(add2, scale) ||
+            ggml_node_get_use_count(cgraph, last) != 1 || (scale->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    if (check_memory) {
+        const ggml_tensor * concat = cgraph->nodes[i];
+        const ggml_tensor * cpy    = cgraph->nodes[i + 3];
+        const ggml_tensor * conv   = cgraph->nodes[i + 4];
+        const ggml_tensor * add    = cgraph->nodes[i + 6];
+        const ggml_tensor * past   = concat->src[0];
+        const ggml_tensor * x      = concat->src[1];
+        const ggml_tensor * res    = add->src[0]->op == GGML_OP_RESHAPE && add->src[0]->src[0] == conv ? add->src[1] : add->src[0];
+        // the sum is written where the step's output would have been: the same rules, plus its own residual
+        if (ggml_cuda_fusion_overlap(add2, past) || ggml_cuda_fusion_overlap(add2, conv->src[1]) ||
+                ggml_cuda_fusion_overlap(add2, cpy->src[1]) || !ggml_cuda_fusion_elementwise_ok(add2, res) ||
+                !ggml_cuda_fusion_elementwise_ok(add2, res2) ||
+                (ggml_cuda_fusion_overlap(add2, x) && !(add2->data == x->data && x->nb[1] == sizeof(float)))) {
+            return -1;
+        }
+    }
+    return k;
+}
+
 // the number of consecutive MUL_MAT nodes from i, at most 4, that one mmvf launch can compute: one F32 vector, the
 // same src1, 2D contiguous src0 of one type and row length, and no node reading another's result
 // a short convolution step for one token: CONCAT(history, x) -> VIEW(last n_conv - 1 columns) -> VIEW(state cell)
@@ -2074,6 +2111,13 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     if (node->op == GGML_OP_CONCAT) {
         const int last = ggml_cuda_match_ssm_conv_step(cgraph, i);
         if (last > 0) {
+            const int last2 = ggml_cuda_match_ssm_conv_step_residual(cgraph, i, last);
+            if (last2 > 0) {
+                ggml_tensor * add2 = cgraph->nodes[last2];
+                ggml_cuda_op_ssm_conv_step(*cuda_ctx, node, cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 6],
+                                           cgraph->nodes[last], add2->src[0] == cgraph->nodes[last] ? add2->src[1] : add2->src[0], add2);
+                return last2 - i;
+            }
             ggml_cuda_op_ssm_conv_step(*cuda_ctx, node, cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 6],
                                        cgraph->nodes[last]);
             return last - i;
@@ -2733,6 +2777,10 @@ void ggml_cuda_fusion_add_alloc_deps(ggml_backend_cuda_context * cuda_ctx, ggml_
                 last = ggml_cuda_match_ctrl_batch(cgraph, i, false);
                 if (last < 0) {
                     last = ggml_cuda_match_ssm_conv_step(cgraph, i, false);
+                    if (last > 0) {
+                        const int last2 = ggml_cuda_match_ssm_conv_step_residual(cgraph, i, last, false);
+                        last = last2 > 0 ? last2 : last;
+                    }
                 }
             } else if (op == GGML_OP_RMS_NORM) {
                 last = ggml_cuda_match_depth_mix(cgraph, i, false) ? i + 6 : -1;
