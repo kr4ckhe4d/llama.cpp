@@ -19,12 +19,24 @@ static __global__ void mul_mat_vec_f(
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride) {
+        const int ids_stride, const int nrows) {
+    if ((int) blockIdx.x >= nrows) {
+        return;
+    }
+    // several matrices on the same y: the rows of the grid run through them in turn
+    int row = blockIdx.x;
+    for (int k = fusion.n_extra; k > 0; --k) {
+        if (row >= fusion.row_start[k]) {
+            x_ptr   = static_cast<const T *>(fusion.x_extra[k - 1]);
+            dst_ptr = fusion.dst_extra[k - 1];
+            row    -= fusion.row_start[k];
+            break;
+        }
+    }
     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
-    const int row         = blockIdx.x;
     // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens)
     const int channel_dst = blockIdx.y;
     const int tid         = threadIdx.x;
@@ -448,7 +460,14 @@ static void mul_mat_vec_f_switch_fusion(
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const dim3 & block_dims, const dim3 & block_nums, const int nbytes_shared, const int ids_stride, const cudaStream_t stream) {
 
-    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
+    // RDNA4 runs a grid of a multiple of 256 blocks in x about twice as slow (e.g. 17 vs 8 us for a 1024 x 2304 BF16
+    // matrix on an R9700), two idle blocks avoid it; the idle blocks return at the start of the kernel
+    const int nrows = block_nums.x;
+    dim3 grid = block_nums;
+    if (nrows % 256 == 0 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        grid.x += 2;
+    }
+    const ggml_cuda_kernel_launch_params launch_params = {grid, block_dims, nbytes_shared, stream};
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
         fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
@@ -457,7 +476,7 @@ static void mul_mat_vec_f_switch_fusion(
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows);
             return;
        }
     }
@@ -467,7 +486,7 @@ static void mul_mat_vec_f_switch_fusion(
     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows);
 
 }
 
@@ -754,6 +773,25 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
+    // more matrices on the same src1, one vector: their rows extend the grid
+    int64_t nrows_total = ne01;
+    if (fusion && fusion->n_extra > 0) {
+        GGML_ASSERT(!ids && ne11 == 1 && ne02 == 1 && ne03 == 1 && dst->ne[1] == 1);
+        GGML_ASSERT(!fusion->gate && !fusion->x_bias && !fusion->x_scale);
+        GGML_ASSERT(fusion->n_extra <= 3);
+        fusion_local.n_extra = fusion->n_extra;
+        for (int k = 0; k < fusion->n_extra; ++k) {
+            const ggml_tensor * xk = fusion->x_extra[k];
+            ggml_tensor       * dk = fusion->dst_extra[k];
+            GGML_ASSERT(xk->type == src0->type && xk->ne[0] == ne00 && xk->nb[1] == nb01 && xk->ne[2] == 1 && xk->ne[3] == 1);
+            GGML_ASSERT(dk->type == GGML_TYPE_F32 && ggml_is_contiguous(dk) && dk->ne[0] == xk->ne[1] && ggml_nrows(dk) == 1);
+            fusion_local.x_extra[k]       = xk->data;
+            fusion_local.dst_extra[k]     = (float *) dk->data;
+            fusion_local.row_start[k + 1] = (int) nrows_total;
+            nrows_total += xk->ne[1];
+        }
+    }
+
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = src1->nb[1] / ts_src1;
     const int64_t s1  =  dst->nb[1] / ts_dst;
@@ -778,25 +816,25 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows_total, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_F16: {
             const half * src0_d = (const half *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows_total, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows_total, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_F8_E4M3: {
             const ggml_fp8_e4m3_t * src0_d = (const ggml_fp8_e4m3_t *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows_total, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03, ne3, s03, s13, s3, ids_stride, prec, ctx.stream());
         } break;

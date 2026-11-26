@@ -4443,6 +4443,16 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
+    // the F16 masks cast to F32 once, at the start of the graph rather than inside the first layer of each kind
+    for (bool swa : { false, true }) {
+        ggml_tensor * mask = swa ? inp->get_attn()->self_attn_mask_swa.raw : inp->get_attn()->self_attn_mask.raw;
+        if (mask && mask->type != GGML_TYPE_F32) {
+            ggml_tensor *& f32 = swa ? inp->self_kq_mask_swa_f32 : inp->self_kq_mask_f32;
+            f32 = ggml_cast(ctx0, mask, GGML_TYPE_F32);
+            ggml_build_forward_expand(gf, f32);
+        }
+    }
+
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
@@ -4471,7 +4481,11 @@ ggml_tensor * llm_graph_context::build_attn(
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
     if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        ggml_tensor *& kq_mask_f32 = is_swa ? inp->self_kq_mask_swa_f32 : inp->self_kq_mask_f32;
+        if (!kq_mask_f32) {
+            kq_mask_f32 = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_mask = kq_mask_f32;
     }
     kq_mask = ggml_add(ctx0, kq_b, kq_mask);
     if (cparams.flash_attn) {
