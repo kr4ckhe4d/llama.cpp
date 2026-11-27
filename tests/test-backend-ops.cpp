@@ -5990,7 +5990,7 @@ struct test_attn_prep : public test_case {
 
 // Inkling 2 SITU on the two halves of a fused gate_up product (fused by CUDA into one element-wise kernel):
 // (tanh(g/beta)*beta * sigmoid(g)) * (tanh(u/lb)*lb)
-struct test_situ : public test_case {
+struct test_situ_branch : public test_case {
     const int64_t n_ff;
     const int64_t n_used;
     const int64_t n_tokens;
@@ -6006,7 +6006,7 @@ struct test_situ : public test_case {
         return VARS_TO_STR3(n_ff, n_used, n_tokens);
     }
 
-    test_situ(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_tokens = 1) : n_ff(n_ff), n_used(n_used), n_tokens(n_tokens) {}
+    test_situ_branch(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_tokens = 1) : n_ff(n_ff), n_used(n_used), n_tokens(n_tokens) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const float beta = 4.0f, lb = 25.0f;
@@ -6182,7 +6182,7 @@ struct test_ctrl_mix : public test_case {
 
 // one token of attention over stored states (Inkling 2 block attention residuals, fused by CUDA):
 // RMS_NORM(cur), appended to the blocks in both layouts, scores against the queries, softmax, weighted sum
-struct test_depth_mix : public test_case {
+struct test_depth_mix_branch : public test_case {
     const int64_t ne;
     const int64_t n_blocks;
     const int64_t nq;
@@ -6203,7 +6203,7 @@ struct test_depth_mix : public test_case {
         return VARS_TO_STR4(ne, n_blocks, nq, norm);
     }
 
-    test_depth_mix(int64_t ne, int64_t n_blocks, int64_t nq, int norm = 0) : ne(ne), n_blocks(n_blocks), nq(nq), norm(norm) {}
+    test_depth_mix_branch(int64_t ne, int64_t n_blocks, int64_t nq, int norm = 0) : ne(ne), n_blocks(n_blocks), nq(nq), norm(norm) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * blocks_s = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne, n_blocks, 1);
@@ -14067,9 +14067,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rel_bias_op(5, 101, 300, 3, 2));
     test_cases.emplace_back(new test_attn_prep(false));
     test_cases.emplace_back(new test_attn_prep(true));
-    test_cases.emplace_back(new test_situ(1152, 8, 1));
-    test_cases.emplace_back(new test_situ(1152, 8, 37));
-    test_cases.emplace_back(new test_situ(100, 3, 5));
+    test_cases.emplace_back(new test_situ_branch(1152, 8, 1));
+    test_cases.emplace_back(new test_situ_branch(1152, 8, 37));
+    test_cases.emplace_back(new test_situ_branch(100, 3, 5));
     test_cases.emplace_back(new test_ctrl_batch(1));
     test_cases.emplace_back(new test_ctrl_batch(3));
     test_cases.emplace_back(new test_ctrl_batch(3, 2304, 64, false));
@@ -14092,13 +14092,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // one token of attention over stored states (Inkling 2)
     for (int64_t n_blocks : {1, 2, 4, 8}) {
         for (int64_t nq : {1, 3, 4}) {
-            test_cases.emplace_back(new test_depth_mix(2304, n_blocks, nq));
+            test_cases.emplace_back(new test_depth_mix_branch(2304, n_blocks, nq));
         }
     }
-    test_cases.emplace_back(new test_depth_mix(1000, 3, 2));
+    test_cases.emplace_back(new test_depth_mix_branch(1000, 3, 2));
     for (int n_blocks : { 1, 3 }) {
-        test_cases.emplace_back(new test_depth_mix(2304, n_blocks, 1, 1));
-        test_cases.emplace_back(new test_depth_mix(2304, n_blocks, 1, 2));
+        test_cases.emplace_back(new test_depth_mix_branch(2304, n_blocks, 1, 1));
+        test_cases.emplace_back(new test_depth_mix_branch(2304, n_blocks, 1, 2));
     }
 
     // one token of a short convolution with its state (Inkling 2)

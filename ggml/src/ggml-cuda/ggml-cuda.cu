@@ -21,6 +21,7 @@
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/conv3d.cuh"
 #include "ggml-cuda/convert.cuh"
+#include "ggml-cuda/ctrl-mix.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"

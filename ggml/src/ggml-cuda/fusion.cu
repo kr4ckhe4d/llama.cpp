@@ -1951,6 +1951,75 @@ static int ggml_cuda_try_fuse_inkling2(ggml_backend_cuda_context * cuda_ctx, ggm
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// a short convolution step for one token: CONCAT(history, x) -> VIEW(last n_conv - 1 columns) -> VIEW(state cell)
+// -> CPY -> SSM_CONV -> RESHAPE -> ADD(residual) -> SCALE (Inkling 2), returns the index of the SCALE or -1
+static int ggml_cuda_match_ssm_conv_step(const ggml_cgraph * cgraph, int i, bool check_memory = true) {
+    if (i + 7 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * concat  = cgraph->nodes[i];
+    const ggml_tensor * v_last  = cgraph->nodes[i + 1];
+    const ggml_tensor * v_cell  = cgraph->nodes[i + 2];
+    const ggml_tensor * cpy     = cgraph->nodes[i + 3];
+    const ggml_tensor * conv    = cgraph->nodes[i + 4];
+    const ggml_tensor * reshape = cgraph->nodes[i + 5];
+    const ggml_tensor * add     = cgraph->nodes[i + 6];
+    const ggml_tensor * scale   = cgraph->nodes[i + 7];
+
+    if (concat->op != GGML_OP_CONCAT || v_last->op != GGML_OP_VIEW || v_cell->op != GGML_OP_VIEW || cpy->op != GGML_OP_CPY ||
+            conv->op != GGML_OP_SSM_CONV || reshape->op != GGML_OP_RESHAPE || add->op != GGML_OP_ADD || scale->op != GGML_OP_SCALE) {
+        return -1;
+    }
+
+    const ggml_tensor * past = concat->src[0];
+    const ggml_tensor * x    = concat->src[1];
+    const ggml_tensor * w    = conv->src[1];
+    const int64_t n_cols = past->ne[0];
+    const int64_t nc     = concat->ne[1];
+
+    // one token and one sequence, F32, the window along dim 0
+    if (ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 || past->type != GGML_TYPE_F32 ||
+            x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || x->ne[0] != 1 || concat->ne[2] != 1 || concat->ne[3] != 1 ||
+            past->nb[0] != sizeof(float) || w->nb[0] != sizeof(float) || w->ne[0] != n_cols + 1 || w->ne[1] != nc ||
+            n_cols < 1 || n_cols > 3) {
+        return -1;
+    }
+    // the store copies the last n_cols columns of the window into a dense cell
+    if (v_last->src[0] != concat || v_last->view_offs != sizeof(float) || v_last->ne[0] != n_cols || v_last->ne[1] != nc ||
+            cpy->src[0] != v_last || cpy->src[1] != v_cell || v_cell->type != GGML_TYPE_F32 || !ggml_is_contiguous(v_cell) ||
+            ggml_nelements(v_cell) != n_cols*nc) {
+        return -1;
+    }
+    if (conv->src[0] != concat || reshape->src[0] != conv || scale->src[0] != add ||
+            (add->src[0] != reshape && add->src[1] != reshape) || ggml_get_op_params_f32(scale, 1) != 0.0f) {
+        return -1;
+    }
+    const ggml_tensor * res = add->src[0] == reshape ? add->src[1] : add->src[0];
+    if (res->type != GGML_TYPE_F32 || !ggml_is_contiguous(res) || ggml_nelements(res) != nc || !ggml_is_contiguous(scale) ||
+            scale->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    // the window and its views stay inside the step
+    if (ggml_node_get_use_count(cgraph, i) != 2 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+            ggml_node_get_use_count(cgraph, i + 4) != 1 || ggml_node_get_use_count(cgraph, i + 5) != 1 ||
+            ggml_node_get_use_count(cgraph, i + 6) != 1) {
+        return -1;
+    }
+    for (int k = 0; k <= 7; ++k) {
+        const ggml_tensor * t = cgraph->nodes[i + k];
+        if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE) || ((t->flags & GGML_TENSOR_FLAG_OUTPUT) && k != 3 && k != 7)) {
+            return -1;
+        }
+    }
+    // the history and the weights are read across channels, x and the residual element-wise (x as [1, nc] of cur)
+    if (check_memory && (ggml_cuda_fusion_overlap(scale, past) || ggml_cuda_fusion_overlap(scale, w) ||
+            !ggml_cuda_fusion_elementwise_ok(scale, res) ||
+            (ggml_cuda_fusion_overlap(scale, x) && !(scale->data == x->data && x->nb[1] == sizeof(float))))) {
+        return -1;
+    }
+    return i + 7;
+}
+
 // a residual ADD right after a conv step (Inkling 2: the layer residual after the attention-out and FFN-out convolutions),
 // which the step can write instead of its own output: returns the index of the ADD, or -1
 static int ggml_cuda_match_ssm_conv_step_residual(const ggml_cgraph * cgraph, int i, int last, bool check_memory = true) {
@@ -2120,75 +2189,6 @@ static int ggml_cuda_match_wo_conv(const ggml_cgraph * cgraph, int i, int & k, i
 
 // the number of consecutive MUL_MAT nodes from i, at most 4, that one mmvf launch can compute: one F32 vector, the
 // same src1, 2D contiguous src0 of one type and row length, and no node reading another's result
-// a short convolution step for one token: CONCAT(history, x) -> VIEW(last n_conv - 1 columns) -> VIEW(state cell)
-// -> CPY -> SSM_CONV -> RESHAPE -> ADD(residual) -> SCALE (Inkling 2), returns the index of the SCALE or -1
-static int ggml_cuda_match_ssm_conv_step(const ggml_cgraph * cgraph, int i, bool check_memory = true) {
-    if (i + 7 >= cgraph->n_nodes) {
-        return -1;
-    }
-    const ggml_tensor * concat  = cgraph->nodes[i];
-    const ggml_tensor * v_last  = cgraph->nodes[i + 1];
-    const ggml_tensor * v_cell  = cgraph->nodes[i + 2];
-    const ggml_tensor * cpy     = cgraph->nodes[i + 3];
-    const ggml_tensor * conv    = cgraph->nodes[i + 4];
-    const ggml_tensor * reshape = cgraph->nodes[i + 5];
-    const ggml_tensor * add     = cgraph->nodes[i + 6];
-    const ggml_tensor * scale   = cgraph->nodes[i + 7];
-
-    if (concat->op != GGML_OP_CONCAT || v_last->op != GGML_OP_VIEW || v_cell->op != GGML_OP_VIEW || cpy->op != GGML_OP_CPY ||
-            conv->op != GGML_OP_SSM_CONV || reshape->op != GGML_OP_RESHAPE || add->op != GGML_OP_ADD || scale->op != GGML_OP_SCALE) {
-        return -1;
-    }
-
-    const ggml_tensor * past = concat->src[0];
-    const ggml_tensor * x    = concat->src[1];
-    const ggml_tensor * w    = conv->src[1];
-    const int64_t n_cols = past->ne[0];
-    const int64_t nc     = concat->ne[1];
-
-    // one token and one sequence, F32, the window along dim 0
-    if (ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 || past->type != GGML_TYPE_F32 ||
-            x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || x->ne[0] != 1 || concat->ne[2] != 1 || concat->ne[3] != 1 ||
-            past->nb[0] != sizeof(float) || w->nb[0] != sizeof(float) || w->ne[0] != n_cols + 1 || w->ne[1] != nc ||
-            n_cols < 1 || n_cols > 3) {
-        return -1;
-    }
-    // the store copies the last n_cols columns of the window into a dense cell
-    if (v_last->src[0] != concat || v_last->view_offs != sizeof(float) || v_last->ne[0] != n_cols || v_last->ne[1] != nc ||
-            cpy->src[0] != v_last || cpy->src[1] != v_cell || v_cell->type != GGML_TYPE_F32 || !ggml_is_contiguous(v_cell) ||
-            ggml_nelements(v_cell) != n_cols*nc) {
-        return -1;
-    }
-    if (conv->src[0] != concat || reshape->src[0] != conv || scale->src[0] != add ||
-            (add->src[0] != reshape && add->src[1] != reshape) || ggml_get_op_params_f32(scale, 1) != 0.0f) {
-        return -1;
-    }
-    const ggml_tensor * res = add->src[0] == reshape ? add->src[1] : add->src[0];
-    if (res->type != GGML_TYPE_F32 || !ggml_is_contiguous(res) || ggml_nelements(res) != nc || !ggml_is_contiguous(scale) ||
-            scale->type != GGML_TYPE_F32) {
-        return -1;
-    }
-    // the window and its views stay inside the step
-    if (ggml_node_get_use_count(cgraph, i) != 2 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
-            ggml_node_get_use_count(cgraph, i + 4) != 1 || ggml_node_get_use_count(cgraph, i + 5) != 1 ||
-            ggml_node_get_use_count(cgraph, i + 6) != 1) {
-        return -1;
-    }
-    for (int k = 0; k <= 7; ++k) {
-        const ggml_tensor * t = cgraph->nodes[i + k];
-        if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE) || ((t->flags & GGML_TENSOR_FLAG_OUTPUT) && k != 3 && k != 7)) {
-            return -1;
-        }
-    }
-    // the history and the weights are read across channels, x and the residual element-wise (x as [1, nc] of cur)
-    if (check_memory && (ggml_cuda_fusion_overlap(scale, past) || ggml_cuda_fusion_overlap(scale, w) ||
-            !ggml_cuda_fusion_elementwise_ok(scale, res) ||
-            (ggml_cuda_fusion_overlap(scale, x) && !(scale->data == x->data && x->nb[1] == sizeof(float))))) {
-        return -1;
-    }
-    return i + 7;
-}
-
 static int ggml_cuda_mul_mat_vec_f_group(const ggml_cgraph * cgraph, int i) {
     const ggml_tensor * first = cgraph->nodes[i];
     const ggml_tensor * src1  = first->src[1];
@@ -2202,7 +2202,7 @@ static int ggml_cuda_mul_mat_vec_f_group(const ggml_cgraph * cgraph, int i) {
             src0->type == first->src[0]->type && src0->ne[0] == first->src[0]->ne[0] && src0->nb[1] == first->src[0]->nb[1] &&
             src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0) &&
             mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) && !ggml_cuda_op_mul_mat_use_fwht(mm) &&
-            ggml_cuda_should_use_mmvf(src0, cc, warp_size, 1);
+            ggml_cuda_should_use_mmvf(src0, src1->type, cc, warp_size, 1, false);
     };
 
     if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || ggml_nrows(src1) != 1 || !eligible(first)) {
