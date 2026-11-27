@@ -2318,6 +2318,14 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     }
 
     if (node->op == GGML_OP_MUL) {
+        const int last = ggml_cuda_match_attn_prep(cgraph, i);
+        if (last > 0) {
+            ggml_cuda_op_attn_prep(*cuda_ctx, cgraph, i, last);
+            return last - i;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL) {
         const int last = ggml_cuda_match_mul_l2_norm(cgraph, i);
         if (last > 0) {
             ggml_cuda_op_mul_l2_norm(*cuda_ctx, cgraph, i, last);
@@ -2337,14 +2345,6 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
         const int last = ggml_cuda_match_rel_bias_batch(cgraph, i);
         if (last > 0) {
             ggml_cuda_op_rel_bias_batch(*cuda_ctx, cgraph, i, last);
-            return last - i;
-        }
-    }
-
-    if (node->op == GGML_OP_MUL) {
-        const int last = ggml_cuda_match_attn_prep(cgraph, i);
-        if (last > 0) {
-            ggml_cuda_op_attn_prep(*cuda_ctx, cgraph, i, last);
             return last - i;
         }
     }
