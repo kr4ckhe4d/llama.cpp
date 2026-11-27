@@ -2102,8 +2102,14 @@ static int ggml_cuda_match_moe_conv_step(const ggml_cgraph * cgraph, int i, ggml
         const ggml_tensor * out  = cgraph->nodes[end];
         const ggml_tensor * cell = cgraph->nodes[k + 3]->src[1];
         const ggml_tensor * ins[] = { match.experts, match.expert_scale, match.weights, concat->src[0], conv->src[1] };
+        // Upstream 7b74cb92d reads recurrent states in place instead of copying, so the step's state cell and
+        // the history window it reads are now views of the same cache tensor. That pair is the rolling state
+        // itself -- the kernel loads the window before storing the cell -- so it is not a hazard.
         for (const ggml_tensor * o : { (const ggml_tensor *) md, cell, out }) {
             for (const ggml_tensor * in : ins) {
+                if (o == cell && in == concat->src[0]) {
+                    continue;
+                }
                 if (in && ggml_cuda_fusion_overlap(o, in)) {
                     return -1;
                 }
@@ -2166,8 +2172,14 @@ static int ggml_cuda_match_wo_conv(const ggml_cgraph * cgraph, int i, int & k, i
         const ggml_tensor * out  = cgraph->nodes[last];
         const ggml_tensor * cell = cgraph->nodes[k + 3]->src[1];
         const ggml_tensor * ins[] = { x, y, concat->src[0], conv->src[1] };
+        // Upstream 7b74cb92d reads recurrent states in place instead of copying, so the step's state cell and
+        // the history window it reads are now views of the same cache tensor. That pair is the rolling state
+        // itself -- the kernel loads the window before storing the cell -- so it is not a hazard.
         for (const ggml_tensor * o : { (const ggml_tensor *) mm, cell, out }) {
             for (const ggml_tensor * in : ins) {
+                if (o == cell && in == concat->src[0]) {
+                    continue;
+                }
                 if (ggml_cuda_fusion_overlap(o, in)) {
                     return -1;
                 }
