@@ -5555,6 +5555,103 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GGML_OP_CONCAT(conv_state, transpose(x), 0) + optional GGML_OP_CPY(state_out) + GGML_OP_SSM_CONV + optional GGML_OP_UNARY(SILU)
+struct test_ssm_conv_concat_fusion : public test_case {
+    const ggml_type type;
+    const int64_t   d_conv;
+    const int64_t   d_inner;
+    const int64_t   n_t;
+    const int64_t   n_s;
+    const bool      use_silu;
+    const bool      has_state_cpy;
+
+    ggml_tensor * conv_out_node  = nullptr;
+    ggml_tensor * state_out_node = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_CONCAT_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, d_conv, d_inner, n_t, n_s, use_silu, has_state_cpy);
+    }
+
+    test_ssm_conv_concat_fusion(ggml_type type, int64_t d_conv, int64_t d_inner, int64_t n_t, int64_t n_s,
+                                bool use_silu, bool has_state_cpy)
+        : type(type), d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s),
+          use_silu(use_silu), has_state_cpy(has_state_cpy) {}
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        return is_htp_backend(backend) ? 1e-4 : test_case::max_nmse_err(backend);
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (has_state_cpy && state_out_node) {
+            return { conv_out_node, state_out_node };
+        }
+        return { conv_out_node };
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t s_cols = d_conv - 1;
+
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, type, s_cols, d_inner, n_s);
+        ggml_set_name(state, "state");
+
+        ggml_tensor * x_raw = ggml_new_tensor_3d(ctx, type, d_inner, n_t, n_s);
+        ggml_set_name(x_raw, "x_raw");
+
+        // Feed rms_norm output into concat/ssm_conv so internal activations can be lowered while state stays F32
+        ggml_tensor * x = ggml_rms_norm(ctx, x_raw, 1e-5f);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, d_conv, d_inner);
+        ggml_set_name(weight, "weight");
+
+        ggml_tensor * conv_x = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        ggml_set_name(conv_x, "conv_x");
+
+        if (has_state_cpy) {
+            const int64_t mem_size = n_s + 2;
+            const int64_t kv_head  = 1;
+
+            ggml_tensor * last = ggml_view_3d(ctx, conv_x,
+                    s_cols, d_inner, n_s,
+                    conv_x->nb[1], conv_x->nb[2],
+                    ggml_row_size(conv_x->type, n_t));
+            ggml_set_name(last, "conv_x_tail");
+
+            ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, s_cols * d_inner, mem_size);
+            ggml_set_name(cache, "cache");
+
+            ggml_tensor * cell = ggml_view_2d(ctx, cache,
+                    s_cols * d_inner, n_s,
+                    cache->nb[1], kv_head * cache->nb[1]);
+            ggml_set_name(cell, "cell");
+
+            state_out_node = ggml_cpy(ctx, last, cell);
+            ggml_set_name(state_out_node, "state_cpy");
+            ggml_build_forward_expand(gf, state_out_node);
+        }
+
+        ggml_tensor * out = ggml_ssm_conv(ctx, conv_x, weight);
+        ggml_set_name(out, "conv_raw");
+
+        if (use_silu) {
+            out = ggml_silu(ctx, out);
+            ggml_set_name(out, "conv_silu");
+        }
+
+        // Consume conv output via rms_norm so conv output is an internal activation
+        conv_out_node = ggml_rms_norm(ctx, out, 1e-5f);
+        ggml_set_name(conv_out_node, "out");
+        return conv_out_node;
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_RESHAPE + GGML_OP_ADD (residual) + GGML_OP_SCALE (fused operation, Inkling 2)
 struct test_ssm_conv_res_scale : public test_case {
     const ggml_type type;
