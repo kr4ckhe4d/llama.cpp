@@ -3003,16 +3003,6 @@ void ggml_cuda_fusion_add_alloc_deps(ggml_backend_cuda_context * cuda_ctx, ggml_
             }
         }
 
-        // A single MUL_MAT_ID with a per-expert scale (RESHAPE, REPEAT, GET_ROWS, MUL), e.g. the NVFP4 down
-        // projection: its src1 must not be reused for the scaled output, or the fusion is refused.
-        if (i + 4 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[i + 4]->op == GGML_OP_MUL &&
-                ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
-                                               cgraph->nodes[i + 4], cgraph->nodes[i])) {
-            add_alloc_deps(i, i + 4);
-            i += 4;
-            continue;
-        }
-
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
