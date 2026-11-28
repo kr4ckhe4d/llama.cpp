@@ -1652,11 +1652,15 @@ json oaicompat_chat_params_parse(
                 inputs.chat_template_kwargs.erase("reasoning_effort");
             }
         } else if (!reasoning_effort.empty()) {
+            // LOCAL PATCH: "minimal" (Pi, OpenAI) is not a level chat templates know; Qwen3.8's
+            // raises "Unexpected reasoning effort minimal" (HTTP 500). Template gets "low"; the
+            // budget below still uses "minimal".
+            const std::string tmpl_effort = reasoning_effort == "minimal" ? std::string("low") : reasoning_effort;
             const auto rejected = caps.at("reasoning_effort_rejected").get<std::vector<std::string>>();
-            if (std::find(rejected.begin(), rejected.end(), reasoning_effort) != rejected.end()) {
+            if (std::find(rejected.begin(), rejected.end(), tmpl_effort) != rejected.end()) {
                 throw std::invalid_argument("reasoning_effort \"" + reasoning_effort + "\" is not supported by the chat template, supported levels: " + string_join(levels, ", "));
             }
-            inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+            inputs.chat_template_kwargs["reasoning_effort"] = json(tmpl_effort).dump();
         }
     }
 
@@ -1674,10 +1678,33 @@ json oaicompat_chat_params_parse(
         int reasoning_budget = json_value(body, "reasoning_budget_tokens",
                                json_value(body, "thinking_budget_tokens", -1));
         if (reasoning_budget == -1) {
-            reasoning_budget = opt.reasoning_budget;
+            // LOCAL PATCH (local-llm-benchmarks/patches/llama-per-request-thinking.patch):
+            // without an explicit budget, the standard "reasoning_effort" decides, so a client
+            // can turn thinking on even when the server started with --reasoning-budget 0
+            // ("none" already disabled it above). Anything else keeps the server default.
+            const std::string effort = json_value(body, "reasoning_effort", std::string());
+            if (effort == "minimal") {
+                reasoning_budget = 1024;
+            } else if (effort == "low") {
+                reasoning_budget = 2048;
+            } else if (effort == "medium") {
+                reasoning_budget = 8192;
+            } else if (effort == "high" || effort == "xhigh" || effort == "max") {
+                reasoning_budget = -1; // unlimited
+            } else {
+                reasoning_budget = opt.reasoning_budget;
+            }
         }
 
         if (!out_session.thinking_end_tags().empty()) {
+            // LOCAL PATCH: Inkling closes a thinking block with the generic <|end_message|>. Forcing
+            // it at budget 0 makes the model open another thinking block, without end. Its template
+            // already says "Thinking effort level: 0" for none/off, where it thinks ~40 tokens and
+            // answers, so give it room instead of forcing.
+            if (reasoning_budget == 0 && out_session.thinking_end_tags().size() == 1 &&
+                out_session.thinking_end_tags()[0] == "<|end_message|>") {
+                reasoning_budget = 1024;
+            }
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = out_session.thinking_start_tag();
             llama_params["reasoning_budget_end_tags"] = out_session.thinking_end_tags();

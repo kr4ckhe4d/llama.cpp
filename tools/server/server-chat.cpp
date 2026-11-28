@@ -650,12 +650,29 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     }
 
     // Handle Anthropic-specific thinking param
-    if (body.contains("thinking")) {
-        json thinking = json_value(body, "thinking", json::object());
-        std::string thinking_type = json_value(thinking, "type", std::string());
-        if (thinking_type == "enabled") {
-            int budget_tokens = json_value(thinking, "budget_tokens", 10000);
-            oai_body["thinking_budget_tokens"] = budget_tokens;
+    // LOCAL PATCH (local-llm-benchmarks/patches/llama-per-request-thinking.patch): follow the
+    // Anthropic API's semantics so the client decides, whatever --reasoning-budget the server
+    // started with: no "thinking" (or type "disabled") = no thinking; "enabled" = its
+    // budget_tokens; "adaptive" (what Claude Code sends) = thinking on, sized by
+    // output_config.effort, which the OAI layer maps to a budget (see server-common.cpp).
+    {
+        std::string thinking_type;
+        if (body.contains("thinking")) {
+            json thinking = json_value(body, "thinking", json::object());
+            thinking_type = json_value(thinking, "type", std::string());
+            if (thinking_type == "enabled") {
+                int budget_tokens = json_value(thinking, "budget_tokens", 10000);
+                oai_body["thinking_budget_tokens"] = budget_tokens;
+            }
+        }
+        if (thinking_type == "adaptive") {
+            std::string effort = "high";
+            if (body.contains("output_config") && body.at("output_config").is_object()) {
+                effort = json_value(body.at("output_config"), "effort", effort);
+            }
+            oai_body["reasoning_effort"] = effort;
+        } else if (thinking_type != "enabled") {
+            oai_body["reasoning_effort"] = "none";
         }
     }
 
