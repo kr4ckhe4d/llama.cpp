@@ -220,8 +220,42 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_inkling2::graph::stack(const
     return res;
 }
 
+// the normalized states of list, last first: [norm(l_n-1), ..., norm(l_0)], each prefix built once per graph
+ggml_tensor * llama_model_inkling2::graph::mix_stack(const std::vector<ggml_tensor *> & list) {
+    const auto it = mix_stacks.find(list);
+    if (it != mix_stacks.end()) {
+        return it->second;
+    }
+
+    ggml_tensor * res = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, list.back(), n_embd, 1, n_tokens), 1e-6f);
+    if (list.size() > 1) {
+        res = ggml_concat(ctx0, res, mix_stack(std::vector<ggml_tensor *>(list.begin(), list.end() - 1)), 1);
+    }
+
+    return mix_stacks[list] = res;
+}
+
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    if (n_tokens > 1) {
+        // a prompt batch: RMS_NORM, CONCAT, REPEAT, MUL_MAT, SOFT_MAX, TRANSPOSE, CONT, MUL_MAT in this order is what
+        // the fused depth mix takes (ggml_cuda_try_fuse_depth_mix); the one-token shape below would run as matrix
+        // products with 2 to 5 columns per token
+        ggml_tensor * states = mix_stack({cur});
+        if (!blocks.empty()) {
+            states = ggml_concat(ctx0, mix_stack(blocks), states, 1);
+        }
+
+        ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+
+        ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+        scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+
+        // [n_queries, n_embd, n_tokens]; the callers take [n_embd, n_queries, n_tokens], the same layout for one query
+        ggml_tensor * res = ggml_mul_mat(ctx0, scores, ggml_cont(ctx0, ggml_transpose(ctx0, states)));
+        return query->ne[1] == 1 ? ggml_reshape_3d(ctx0, res, n_embd, 1, n_tokens) : ggml_cont(ctx0, ggml_permute(ctx0, res, 1, 0, 2, 3));
+    }
+
     // the softmax over the depth does not depend on the order of the states, so the normalized
     // blocks are stacked once per prefix and only cur is normalized and appended here
     const auto [blocks_s, blocks_t] = stack(blocks);

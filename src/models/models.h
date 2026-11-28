@@ -2694,6 +2694,10 @@ struct llama_model_inkling2 : public llama_model_base {
         // the RMS-normalized blocks stacked as [n_embd, n_blocks, n_tokens] and transposed, built once per prefix
         std::pair<ggml_tensor *, ggml_tensor *> stack(const std::vector<ggml_tensor *> & blocks);
         std::map<std::vector<ggml_tensor *>, std::pair<ggml_tensor *, ggml_tensor *>> stacks;
+        // prompt batches: the normalized blocks newest first, [n_embd, n_blocks, n_tokens], in the shape of upstream's
+        // fused depth mix
+        ggml_tensor * mix_stack(const std::vector<ggml_tensor *> & list);
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_stacks;
         // RMS norms of the shared layer inputs, and the zero attention sinks, built once per graph
         ggml_tensor * rms_norm_once(ggml_tensor * cur);
         std::map<ggml_tensor *, ggml_tensor *> rms_norms;
